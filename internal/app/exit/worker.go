@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -25,7 +26,6 @@ type Worker struct {
 }
 
 type remoteSession struct {
-	id       string
 	conn     net.Conn
 	inbound  chan []byte
 	closed   atomic.Bool
@@ -48,7 +48,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	w.nc = nc
 	defer nc.Drain()
 
-	upstreamSub, err := nc.Subscribe(tunnel.UpWildcard(w.cfg.Tunnel.SubjectPrefix), w.handleUpstream)
+	upstreamSub, err := nc.Subscribe(tunnel.UpSubject(w.cfg.Tunnel.SubjectPrefix), w.handleUpstream)
 	if err != nil {
 		return fmt.Errorf("subscribe upstream: %w", err)
 	}
@@ -89,10 +89,10 @@ func (w *Worker) handleConnect(ctx context.Context, msg *nats.Msg) {
 	}
 
 	dialer := net.Dialer{Timeout: w.cfg.Exit.DialTimeout.Duration}
-	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(req.Host, fmt.Sprintf("%d", req.Port)))
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(req.Host, strconv.Itoa(req.Port)))
 	if err != nil {
 		w.reply(msg, "ERR dial failed")
-		w.logger.Printf("[%s] dial %s:%d failed: %v", req.CID, req.Host, req.Port, err)
+		w.logger.Printf("[%016x] dial %s:%d failed: %v", req.CID, req.Host, req.Port, err)
 		return
 	}
 
@@ -104,7 +104,6 @@ func (w *Worker) handleConnect(ctx context.Context, msg *nats.Msg) {
 	})
 
 	remote := &remoteSession{
-		id:      req.CID,
 		conn:    conn,
 		inbound: make(chan []byte, w.cfg.Tunnel.SessionQueueDepth),
 	}
@@ -112,18 +111,18 @@ func (w *Worker) handleConnect(ctx context.Context, msg *nats.Msg) {
 	if err := w.registry.Add(req.CID, remote); err != nil {
 		_ = conn.Close()
 		w.reply(msg, "ERR duplicate session")
-		w.logger.Printf("[%s] duplicate session id", req.CID)
+		w.logger.Printf("[%016x] duplicate session id", req.CID)
 		return
 	}
 
 	if err := msg.Respond([]byte("OK")); err != nil {
 		_ = conn.Close()
 		w.unregister(req.CID)
-		w.logger.Printf("[%s] connect reply failed: %v", req.CID, err)
+		w.logger.Printf("[%016x] connect reply failed: %v", req.CID, err)
 		return
 	}
-	w.logger.Printf("[%s] proxying %s:%d", req.CID, req.Host, req.Port)
-	downSubject := tunnel.DownSubject(w.cfg.Tunnel.SubjectPrefix, req.CID)
+	w.logger.Printf("[%016x] proxying %s:%d", req.CID, req.Host, req.Port)
+	downSubject := tunnel.DownSubject(w.cfg.Tunnel.SubjectPrefix)
 
 	w.wg.Add(1)
 	go func() {
@@ -131,6 +130,7 @@ func (w *Worker) handleConnect(ctx context.Context, msg *nats.Msg) {
 		defer w.unregister(req.CID)
 
 		bridge := tunnel.Bridge{
+			SessionID:          req.CID,
 			Conn:               conn,
 			Incoming:           remote.inbound,
 			ChunkSize:          w.cfg.Tunnel.ChunkSizeBytes,
@@ -143,18 +143,18 @@ func (w *Worker) handleConnect(ctx context.Context, msg *nats.Msg) {
 		}
 
 		if bridgeErr := bridge.Run(ctx); bridgeErr != nil {
-			w.logger.Printf("[%s] bridge ended with error: %v", req.CID, bridgeErr)
+			w.logger.Printf("[%016x] bridge ended with error: %v", req.CID, bridgeErr)
 			return
 		}
 
-		w.logger.Printf("[%s] closed", req.CID)
+		w.logger.Printf("[%016x] closed", req.CID)
 	}()
 }
 
 func (w *Worker) handleUpstream(msg *nats.Msg) {
-	sessionID, err := tunnel.SessionIDFromSubject(msg.Subject)
+	sessionID, err := tunnel.SessionIDFromFrame(msg.Data)
 	if err != nil {
-		w.logger.Printf("invalid upstream subject %q: %v", msg.Subject, err)
+		w.logger.Printf("invalid upstream frame: %v", err)
 		return
 	}
 
@@ -165,18 +165,14 @@ func (w *Worker) handleUpstream(msg *nats.Msg) {
 	}
 }
 
-func (w *Worker) unregister(id string) {
+func (w *Worker) unregister(id uint64) {
 	if sink := w.registry.Remove(id); sink != nil {
 		sink.Close()
 	}
 }
 
 func (w *Worker) reply(msg *nats.Msg, payload string) {
-	if msg.Reply == "" {
-		return
-	}
-
-	if err := w.nc.Publish(msg.Reply, []byte(payload)); err != nil {
+	if err := msg.Respond([]byte(payload)); err != nil && msg.Reply != "" {
 		w.logger.Printf("reply failed: %v", err)
 	}
 }

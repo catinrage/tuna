@@ -20,11 +20,11 @@ func TestRegistryAddDeliverRemove(t *testing.T) {
 	registry := NewRegistry()
 	sink := &stubSink{}
 
-	if err := registry.Add("abc", sink); err != nil {
+	if err := registry.Add(1, sink); err != nil {
 		t.Fatalf("add session: %v", err)
 	}
 
-	if !registry.Deliver("abc", []byte("hello")) {
+	if !registry.Deliver(1, []byte("hello")) {
 		t.Fatalf("deliver returned false")
 	}
 
@@ -32,23 +32,23 @@ func TestRegistryAddDeliverRemove(t *testing.T) {
 		t.Fatalf("unexpected payloads: %#v", sink.payloads)
 	}
 
-	removed := registry.Remove("abc")
+	removed := registry.Remove(1)
 	if removed != sink {
 		t.Fatalf("remove returned %v, want original sink", removed)
 	}
 
-	if registry.Deliver("abc", []byte("again")) {
+	if registry.Deliver(1, []byte("again")) {
 		t.Fatalf("deliver succeeded after remove")
 	}
 }
 
 func TestRegistryRejectsDuplicateSession(t *testing.T) {
 	registry := NewRegistry()
-	if err := registry.Add("dup", &stubSink{}); err != nil {
+	if err := registry.Add(1, &stubSink{}); err != nil {
 		t.Fatalf("first add failed: %v", err)
 	}
 
-	if err := registry.Add("dup", &stubSink{}); err != ErrSessionExists {
+	if err := registry.Add(1, &stubSink{}); err != ErrSessionExists {
 		t.Fatalf("second add error = %v, want %v", err, ErrSessionExists)
 	}
 }
@@ -58,10 +58,10 @@ func TestRegistryCloseAllClosesEachSink(t *testing.T) {
 	first := &stubSink{}
 	second := &stubSink{}
 
-	if err := registry.Add("a", first); err != nil {
+	if err := registry.Add(1, first); err != nil {
 		t.Fatalf("add first: %v", err)
 	}
-	if err := registry.Add("b", second); err != nil {
+	if err := registry.Add(2, second); err != nil {
 		t.Fatalf("add second: %v", err)
 	}
 
@@ -71,7 +71,7 @@ func TestRegistryCloseAllClosesEachSink(t *testing.T) {
 		t.Fatalf("expected all sinks to be closed: first=%v second=%v", first.closed, second.closed)
 	}
 
-	if removed := registry.Remove("a"); removed != nil {
+	if removed := registry.Remove(1); removed != nil {
 		t.Fatalf("expected registry to be empty after close all")
 	}
 }

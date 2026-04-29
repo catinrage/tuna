@@ -19,6 +19,7 @@ func TestBridgeRunCopiesSocketToPublisherAndBack(t *testing.T) {
 	incoming := make(chan []byte, 2)
 	published := make(chan []byte, 2)
 	bridge := Bridge{
+		SessionID:       7,
 		Conn:            local,
 		Incoming:        incoming,
 		ChunkSize:       32,
@@ -40,14 +41,28 @@ func TestBridgeRunCopiesSocketToPublisherAndBack(t *testing.T) {
 
 	select {
 	case frame := <-published:
-		if frame[0] != FrameData || !bytes.Equal(frame[1:], []byte("hello")) {
+		kind, err := FrameType(frame)
+		if err != nil {
+			t.Fatalf("frame type failed: %v", err)
+		}
+		sessionID, err := SessionIDFromFrame(frame)
+		if err != nil {
+			t.Fatalf("session id failed: %v", err)
+		}
+		payload, err := FramePayload(frame)
+		if err != nil {
+			t.Fatalf("frame payload failed: %v", err)
+		}
+		if kind != FrameData || sessionID != 7 || !bytes.Equal(payload, []byte("hello")) {
 			t.Fatalf("published frame = %v", frame)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for published frame")
 	}
 
-	incoming <- append([]byte{FrameData}, []byte("world")...)
+	outbound := make([]byte, frameHeaderSize+5)
+	copy(outbound[frameHeaderSize:], []byte("world"))
+	incoming <- DataFrame(outbound, 7, 5)
 
 	buf := make([]byte, 5)
 	if _, err := io.ReadFull(peer, buf); err != nil {
@@ -57,7 +72,7 @@ func TestBridgeRunCopiesSocketToPublisherAndBack(t *testing.T) {
 		t.Fatalf("bridged payload = %q, want world", buf)
 	}
 
-	incoming <- EOFFrame()
+	incoming <- EOFFrame(7)
 
 	select {
 	case err := <-errCh:
@@ -86,6 +101,7 @@ func TestBridgePublishesEOFOnSocketClose(t *testing.T) {
 	frames := make([][]byte, 0, 2)
 
 	bridge := Bridge{
+		SessionID:       1,
 		Conn:            local,
 		Incoming:        incoming,
 		ChunkSize:       32,
@@ -116,7 +132,7 @@ func TestBridgePublishesEOFOnSocketClose(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(frames) == 0 || !bytes.Equal(frames[len(frames)-1], EOFFrame()) {
+	if len(frames) == 0 || !bytes.Equal(frames[len(frames)-1], EOFFrame(1)) {
 		t.Fatalf("expected EOF frame, got %v", frames)
 	}
 }
@@ -128,6 +144,7 @@ func TestBridgeRunPropagatesUnknownFrameError(t *testing.T) {
 
 	incoming := make(chan []byte, 1)
 	bridge := Bridge{
+		SessionID:       9,
 		Conn:            local,
 		Incoming:        incoming,
 		ChunkSize:       32,
@@ -140,7 +157,9 @@ func TestBridgeRunPropagatesUnknownFrameError(t *testing.T) {
 		errCh <- bridge.Run(context.Background())
 	}()
 
-	incoming <- []byte{'X'}
+	invalid := make([]byte, frameHeaderSize)
+	invalid[0] = 'X'
+	incoming <- invalid
 
 	select {
 	case err := <-errCh:
@@ -162,6 +181,7 @@ func TestBridgeCoalescesSocketReads(t *testing.T) {
 	incoming := make(chan []byte, 1)
 	published := make(chan []byte, 2)
 	bridge := Bridge{
+		SessionID:         11,
 		Conn:              local,
 		Incoming:          incoming,
 		ChunkSize:         32,
@@ -186,7 +206,11 @@ func TestBridgeCoalescesSocketReads(t *testing.T) {
 
 	select {
 	case frame := <-published:
-		if got, want := string(frame[1:]), "helloworld"; got != want {
+		payload, err := FramePayload(frame)
+		if err != nil {
+			t.Fatalf("frame payload failed: %v", err)
+		}
+		if got, want := string(payload), "helloworld"; got != want {
 			t.Fatalf("coalesced frame payload = %q, want %q", got, want)
 		}
 	case <-time.After(2 * time.Second):

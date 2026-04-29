@@ -14,14 +14,14 @@ type Sink interface {
 
 type Registry struct {
 	mu       sync.RWMutex
-	sessions map[string]Sink
+	sessions map[uint64]Sink
 }
 
 func NewRegistry() *Registry {
-	return &Registry{sessions: make(map[string]Sink)}
+	return &Registry{sessions: make(map[uint64]Sink)}
 }
 
-func (r *Registry) Add(id string, sink Sink) error {
+func (r *Registry) Add(id uint64, sink Sink) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -33,7 +33,7 @@ func (r *Registry) Add(id string, sink Sink) error {
 	return nil
 }
 
-func (r *Registry) Remove(id string) Sink {
+func (r *Registry) Remove(id uint64) Sink {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -42,7 +42,7 @@ func (r *Registry) Remove(id string) Sink {
 	return sink
 }
 
-func (r *Registry) Deliver(id string, payload []byte) bool {
+func (r *Registry) Deliver(id uint64, payload []byte) bool {
 	r.mu.RLock()
 	sink := r.sessions[id]
 	r.mu.RUnlock()

@@ -1,17 +1,18 @@
 package tunnel
 
 import (
+	"encoding/binary"
 	"fmt"
-	"strings"
 )
 
 const (
-	FrameData byte = 'D'
-	FrameEOF  byte = 'E'
+	FrameData       byte = 'D'
+	FrameEOF        byte = 'E'
+	frameHeaderSize      = 9
 )
 
 type ConnectRequest struct {
-	CID  string `json:"cid"`
+	CID  uint64 `json:"cid"`
 	Host string `json:"host"`
 	Port int    `json:"port"`
 }
@@ -20,36 +21,47 @@ func ConnectSubject(prefix string) string {
 	return prefix + ".connect"
 }
 
-func UpSubject(prefix, id string) string {
-	return prefix + ".up." + id
+func UpSubject(prefix string) string {
+	return prefix + ".up"
 }
 
-func DownSubject(prefix, id string) string {
-	return prefix + ".down." + id
+func DownSubject(prefix string) string {
+	return prefix + ".down"
 }
 
-func UpWildcard(prefix string) string {
-	return prefix + ".up.*"
+func DataFrame(buf []byte, sessionID uint64, n int) []byte {
+	buf[0] = FrameData
+	binary.BigEndian.PutUint64(buf[1:frameHeaderSize], sessionID)
+	return buf[:n+frameHeaderSize]
 }
 
-func DownWildcard(prefix string) string {
-	return prefix + ".down.*"
+func EOFFrame(sessionID uint64) []byte {
+	buf := make([]byte, frameHeaderSize)
+	buf[0] = FrameEOF
+	binary.BigEndian.PutUint64(buf[1:frameHeaderSize], sessionID)
+	return buf
 }
 
-func SessionIDFromSubject(subject string) (string, error) {
-	idx := strings.LastIndexByte(subject, '.')
-	if idx == -1 || idx == len(subject)-1 {
-		return "", fmt.Errorf("invalid subject %q", subject)
+func SessionIDFromFrame(payload []byte) (uint64, error) {
+	if len(payload) < frameHeaderSize {
+		return 0, fmt.Errorf("frame too short: %d", len(payload))
 	}
 
-	return subject[idx+1:], nil
+	return binary.BigEndian.Uint64(payload[1:frameHeaderSize]), nil
 }
 
-func DataFrame(buf []byte, n int) []byte {
-	buf[0] = FrameData
-	return buf[:n+1]
+func FrameType(payload []byte) (byte, error) {
+	if len(payload) < frameHeaderSize {
+		return 0, fmt.Errorf("frame too short: %d", len(payload))
+	}
+
+	return payload[0], nil
 }
 
-func EOFFrame() []byte {
-	return []byte{FrameEOF}
+func FramePayload(payload []byte) ([]byte, error) {
+	if len(payload) < frameHeaderSize {
+		return nil, fmt.Errorf("frame too short: %d", len(payload))
+	}
+
+	return payload[frameHeaderSize:], nil
 }

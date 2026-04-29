@@ -14,6 +14,7 @@ import (
 type Publisher func(payload []byte) error
 
 type Bridge struct {
+	SessionID          uint64
 	Conn               net.Conn
 	Incoming           <-chan []byte
 	Publish            Publisher
@@ -71,16 +72,16 @@ func (b *Bridge) Run(ctx context.Context) error {
 }
 
 func (b *Bridge) socketToNATS(ctx context.Context, remoteClosed *atomic.Bool) error {
-	buf := make([]byte, b.ChunkSize+1)
+	buf := make([]byte, b.ChunkSize+frameHeaderSize)
 
 	for {
-		n, err := b.Conn.Read(buf[1:])
+		n, err := b.Conn.Read(buf[frameHeaderSize:])
 		if n > 0 && err == nil && b.ReadCoalesceDelay > 0 && n < b.ChunkSize {
-			n, err = b.coalesceSocketRead(buf[1:], n)
+			n, err = b.coalesceSocketRead(buf[frameHeaderSize:], n)
 		}
 
 		if n > 0 {
-			if publishErr := b.Publish(DataFrame(buf, n)); publishErr != nil {
+			if publishErr := b.Publish(DataFrame(buf, b.SessionID, n)); publishErr != nil {
 				return publishErr
 			}
 		}
@@ -91,7 +92,7 @@ func (b *Bridge) socketToNATS(ctx context.Context, remoteClosed *atomic.Bool) er
 
 		if errors.Is(err, io.EOF) {
 			if !remoteClosed.Load() {
-				_ = b.Publish(EOFFrame())
+				_ = b.Publish(EOFFrame(b.SessionID))
 			}
 			return nil
 		}
@@ -100,7 +101,7 @@ func (b *Bridge) socketToNATS(ctx context.Context, remoteClosed *atomic.Bool) er
 			return nil
 		}
 
-		_ = b.Publish(EOFFrame())
+		_ = b.Publish(EOFFrame(b.SessionID))
 		return err
 	}
 }
@@ -140,10 +141,19 @@ func (b *Bridge) natsToSocket(ctx context.Context, remoteClosed *atomic.Bool) er
 			continue
 		}
 
-		switch payload[0] {
+		frameType, err := FrameType(payload)
+		if err != nil {
+			return err
+		}
+
+		switch frameType {
 		case FrameData:
-			batch = append(batch, payload[1:])
-			batchBytes += len(payload) - 1
+			framePayload, frameErr := FramePayload(payload)
+			if frameErr != nil {
+				return frameErr
+			}
+			batch = append(batch, framePayload)
+			batchBytes += len(framePayload)
 		case FrameEOF:
 			remoteClosed.Store(true)
 			if err := flush(); err != nil {
@@ -151,7 +161,7 @@ func (b *Bridge) natsToSocket(ctx context.Context, remoteClosed *atomic.Bool) er
 			}
 			return nil
 		default:
-			return fmt.Errorf("unknown frame type %q", payload[0])
+			return fmt.Errorf("unknown frame type %q", frameType)
 		}
 
 		if b.WriteCoalesceDelay <= 0 || batchBytes >= b.WriteBatchBytes {
@@ -184,10 +194,25 @@ func (b *Bridge) natsToSocket(ctx context.Context, remoteClosed *atomic.Bool) er
 					continue
 				}
 
-				switch payload[0] {
+				frameType, err := FrameType(payload)
+				if err != nil {
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return err
+				}
+
+				switch frameType {
 				case FrameData:
-					batch = append(batch, payload[1:])
-					batchBytes += len(payload) - 1
+					framePayload, frameErr := FramePayload(payload)
+					if frameErr != nil {
+						if !timer.Stop() {
+							<-timer.C
+						}
+						return frameErr
+					}
+					batch = append(batch, framePayload)
+					batchBytes += len(framePayload)
 				case FrameEOF:
 					remoteClosed.Store(true)
 					if !timer.Stop() {
@@ -201,7 +226,7 @@ func (b *Bridge) natsToSocket(ctx context.Context, remoteClosed *atomic.Bool) er
 					if !timer.Stop() {
 						<-timer.C
 					}
-					return fmt.Errorf("unknown frame type %q", payload[0])
+					return fmt.Errorf("unknown frame type %q", frameType)
 				}
 			}
 		}

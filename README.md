@@ -37,6 +37,7 @@ Compared with the Python proof of concept, this version is designed around throu
 
 - Go runtime and `nats.go` instead of Python asyncio.
 - One wildcard subscription per data direction instead of one subscription per tunnel.
+- One fixed subject per direction instead of per-session subjects, with the session ID carried in a compact binary frame header.
 - Per-session lock-free fast path using buffered channels.
 - Larger default frame size to cut NATS publish count roughly in half versus the previous `256 KiB` setting.
 - Short read-side coalescing window to merge bursty TCP reads into fewer NATS publishes.
@@ -107,13 +108,14 @@ The observed IP should be the exit server IP.
 With the default prefix `tuna`:
 
 - Connect subject: `tuna.connect`
-- Entry -> exit data: `tuna.up.<session-id>`
-- Exit -> entry data: `tuna.down.<session-id>`
+- Entry -> exit data: `tuna.up`
+- Exit -> entry data: `tuna.down`
 
-Frames are 1 byte of type plus payload:
+Frames are binary:
 
-- `D` + raw bytes
-- `E` for EOF
+- 1 byte frame type
+- 8 byte session ID
+- raw payload for data frames
 
 ## Operational notes
 
@@ -134,11 +136,12 @@ What they should improve in practice:
 - `read_coalesce_delay` at `250us`: often `15%` to `35%` fewer NATS messages for bursty traffic, with a small latency tradeoff on tiny packets.
 - `write_coalesce_delay` plus `write_batch_bytes`: usually `10%` to `25%` better download throughput and lower CPU/syscall overhead on the receiver.
 - Larger default socket buffers and deeper queues: mostly a stability improvement under high-bandwidth, high-RTT flows, with `5%` to `15%` throughput gain when the old buffers were too small.
+- Fixed `tuna.up` / `tuna.down` subjects with binary session headers: usually another `5%` to `15%` less broker and client CPU at high message rates, with a modest latency improvement from removing wildcard subject parsing.
 
 Overall expectation if the broker is not CPU-throttled:
 
 - latency: usually unchanged to `10%` better for downloads, slightly worse for isolated tiny packets because of the `250us` batching window
-- throughput: commonly `1.4x` to `2.5x` better than the previous Go version on sustained transfers
+- throughput: commonly `1.5x` to `2.8x` better than the previous Go version on sustained transfers
 
 ## Automation
 
