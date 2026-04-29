@@ -31,7 +31,6 @@ type NATSConfig struct {
 	URL                  string   `json:"url"`
 	Username             string   `json:"username"`
 	Password             string   `json:"password"`
-	PasswordEnv          string   `json:"password_env"`
 	Name                 string   `json:"name"`
 	ConnectTimeout       Duration `json:"connect_timeout"`
 	ReconnectWait        Duration `json:"reconnect_wait"`
@@ -44,6 +43,9 @@ type NATSConfig struct {
 type TunnelConfig struct {
 	SubjectPrefix               string   `json:"subject_prefix"`
 	ChunkSizeBytes              int      `json:"chunk_size_bytes"`
+	ReadCoalesceDelay           Duration `json:"read_coalesce_delay"`
+	WriteCoalesceDelay          Duration `json:"write_coalesce_delay"`
+	WriteBatchBytes             int      `json:"write_batch_bytes"`
 	SessionQueueDepth           int      `json:"session_queue_depth"`
 	SubscriptionPendingMessages int      `json:"subscription_pending_messages"`
 	SubscriptionPendingBytes    int      `json:"subscription_pending_bytes"`
@@ -127,23 +129,6 @@ func LoadExit(path string) (ExitConfig, error) {
 	return cfg, nil
 }
 
-func (c NATSConfig) ResolvedPassword() (string, error) {
-	if c.Password != "" {
-		return c.Password, nil
-	}
-
-	if c.PasswordEnv == "" {
-		return "", errors.New("nats.password or nats.password_env is required")
-	}
-
-	value := os.Getenv(c.PasswordEnv)
-	if value == "" {
-		return "", fmt.Errorf("environment variable %q is not set", c.PasswordEnv)
-	}
-
-	return value, nil
-}
-
 func applyDefaults(natsCfg *NATSConfig, tunnelCfg *TunnelConfig) {
 	natsCfg.URL = "nats://127.0.0.1:4222"
 	natsCfg.Username = "nats_client"
@@ -155,14 +140,17 @@ func applyDefaults(natsCfg *NATSConfig, tunnelCfg *TunnelConfig) {
 	natsCfg.ReconnectBufferBytes = 64 << 20
 
 	tunnelCfg.SubjectPrefix = "tuna"
-	tunnelCfg.ChunkSizeBytes = 256 << 10
-	tunnelCfg.SessionQueueDepth = 1024
+	tunnelCfg.ChunkSizeBytes = 512 << 10
+	tunnelCfg.ReadCoalesceDelay = Duration{Duration: 250 * time.Microsecond}
+	tunnelCfg.WriteCoalesceDelay = Duration{Duration: 250 * time.Microsecond}
+	tunnelCfg.WriteBatchBytes = 1 << 20
+	tunnelCfg.SessionQueueDepth = 2048
 	tunnelCfg.SubscriptionPendingMessages = 256 * 1024
-	tunnelCfg.SubscriptionPendingBytes = 256 << 20
+	tunnelCfg.SubscriptionPendingBytes = 512 << 20
 	tunnelCfg.TCPNoDelay = true
 	tunnelCfg.TCPKeepAlive = Duration{Duration: 30 * time.Second}
-	tunnelCfg.TCPReadBufferBytes = 1 << 20
-	tunnelCfg.TCPWriteBufferBytes = 1 << 20
+	tunnelCfg.TCPReadBufferBytes = 4 << 20
+	tunnelCfg.TCPWriteBufferBytes = 4 << 20
 }
 
 func loadJSON(path string, dst any) error {
@@ -203,8 +191,8 @@ func validateNATS(cfg NATSConfig) error {
 		return errors.New("nats.reconnect_buffer_bytes cannot be negative")
 	}
 
-	if cfg.Password == "" && cfg.PasswordEnv == "" {
-		return errors.New("nats.password or nats.password_env is required")
+	if cfg.Password == "" {
+		return errors.New("nats.password is required")
 	}
 
 	return nil
@@ -217,6 +205,22 @@ func validateTunnel(cfg TunnelConfig) error {
 
 	if cfg.ChunkSizeBytes <= 0 {
 		return errors.New("tunnel.chunk_size_bytes must be positive")
+	}
+
+	if cfg.ReadCoalesceDelay.Duration < 0 {
+		return errors.New("tunnel.read_coalesce_delay cannot be negative")
+	}
+
+	if cfg.WriteCoalesceDelay.Duration < 0 {
+		return errors.New("tunnel.write_coalesce_delay cannot be negative")
+	}
+
+	if cfg.WriteBatchBytes <= 0 {
+		return errors.New("tunnel.write_batch_bytes must be positive")
+	}
+
+	if cfg.WriteBatchBytes < cfg.ChunkSizeBytes {
+		return errors.New("tunnel.write_batch_bytes must be greater than or equal to tunnel.chunk_size_bytes")
 	}
 
 	if cfg.SessionQueueDepth <= 0 {

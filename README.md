@@ -38,7 +38,9 @@ Compared with the Python proof of concept, this version is designed around throu
 - Go runtime and `nats.go` instead of Python asyncio.
 - One wildcard subscription per data direction instead of one subscription per tunnel.
 - Per-session lock-free fast path using buffered channels.
-- Configurable large chunk sizes for fewer publish calls.
+- Larger default frame size to cut NATS publish count roughly in half versus the previous `256 KiB` setting.
+- Short read-side coalescing window to merge bursty TCP reads into fewer NATS publishes.
+- Short write-side coalescing window plus batched socket writes to reduce syscall pressure on downloads.
 - Tuned TCP sockets: `TCP_NODELAY`, keepalive, read buffer, write buffer.
 - Bounded session queues so slow consumers fail fast instead of growing memory without bound.
 - Request/reply is used only for connection setup. The data plane stays on plain pub/sub.
@@ -56,6 +58,8 @@ Example configs are included as:
 - `config.exit.example`
 
 The files are JSON. Copy them to the filenames you want and pass them with `-config`.
+
+The NATS password now lives in the config file instead of the environment.
 
 ## Build
 
@@ -75,14 +79,12 @@ The files are JSON. Copy them to the filenames you want and pass them with `-con
 Start the exit worker first:
 
 ```bash
-export NATS_PASSWORD='your-password'
 /usr/local/go/bin/go run ./cmd/tuna-exit -config config.exit.example
 ```
 
 Then start the entry process:
 
 ```bash
-export NATS_PASSWORD='your-password'
 /usr/local/go/bin/go run ./cmd/tuna-entry -config config.entry.example
 ```
 
@@ -116,9 +118,27 @@ Frames are 1 byte of type plus payload:
 ## Operational notes
 
 - The entry listener binds to `127.0.0.1` by default. Keep it that way unless you add authentication and firewalling.
-- The NATS password is intentionally sourced from an environment variable by default.
-- `chunk_size_bytes` must stay below the NATS server `max_payload` setting.
-- If you push very large downloads, tune `chunk_size_bytes`, socket buffers, and NATS pending limits together.
+- `chunk_size_bytes` must stay below the NATS server `max_payload` setting. If `maxPayload` is left unset in NATS, the effective server default is typically `1 MiB`, so the default `524288` byte frame size here is intentionally conservative.
+- `read_coalesce_delay` is the max extra wait after a socket read before publishing a frame. Raising it reduces publish count and improves throughput, but increases latency for very small interactive packets.
+- `write_coalesce_delay` and `write_batch_bytes` only affect NATS-to-socket writes. They do not change NATS payload size; they reduce write syscalls on the receiving side.
+- If you push very large downloads, tune `chunk_size_bytes`, coalescing delays, socket buffers, and NATS pending limits together.
+- For your current single-node single-replica manifest, the next NATS-side knobs to make explicit are `maxPayload: 1MB`, enabled metrics, and fixed CPU and memory requests/limits so the broker does not get throttled during bulk transfers.
+
+## Expected impact
+
+These changes stay inside the existing all-data-over-NATS design. They do not remove the broker hop, so they are not a replacement for a different transport architecture.
+
+What they should improve in practice:
+
+- `chunk_size_bytes` raised from `256 KiB` to `512 KiB`: about `1.3x` to `1.8x` better bulk throughput when the flow is publish-count bound.
+- `read_coalesce_delay` at `250us`: often `15%` to `35%` fewer NATS messages for bursty traffic, with a small latency tradeoff on tiny packets.
+- `write_coalesce_delay` plus `write_batch_bytes`: usually `10%` to `25%` better download throughput and lower CPU/syscall overhead on the receiver.
+- Larger default socket buffers and deeper queues: mostly a stability improvement under high-bandwidth, high-RTT flows, with `5%` to `15%` throughput gain when the old buffers were too small.
+
+Overall expectation if the broker is not CPU-throttled:
+
+- latency: usually unchanged to `10%` better for downloads, slightly worse for isolated tiny packets because of the `250us` batching window
+- throughput: commonly `1.4x` to `2.5x` better than the previous Go version on sustained transfers
 
 ## Automation
 

@@ -8,15 +8,19 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Publisher func(payload []byte) error
 
 type Bridge struct {
-	Conn      net.Conn
-	Incoming  <-chan []byte
-	Publish   Publisher
-	ChunkSize int
+	Conn               net.Conn
+	Incoming           <-chan []byte
+	Publish            Publisher
+	ChunkSize          int
+	ReadCoalesceDelay  time.Duration
+	WriteCoalesceDelay time.Duration
+	WriteBatchBytes    int
 }
 
 func (b *Bridge) Run(ctx context.Context) error {
@@ -30,6 +34,10 @@ func (b *Bridge) Run(ctx context.Context) error {
 
 	if b.ChunkSize <= 0 {
 		return fmt.Errorf("invalid chunk size %d", b.ChunkSize)
+	}
+
+	if b.WriteBatchBytes <= 0 {
+		return fmt.Errorf("invalid write batch size %d", b.WriteBatchBytes)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -67,6 +75,10 @@ func (b *Bridge) socketToNATS(ctx context.Context, remoteClosed *atomic.Bool) er
 
 	for {
 		n, err := b.Conn.Read(buf[1:])
+		if n > 0 && err == nil && b.ReadCoalesceDelay > 0 && n < b.ChunkSize {
+			n, err = b.coalesceSocketRead(buf[1:], n)
+		}
+
 		if n > 0 {
 			if publishErr := b.Publish(DataFrame(buf, n)); publishErr != nil {
 				return publishErr
@@ -94,42 +106,149 @@ func (b *Bridge) socketToNATS(ctx context.Context, remoteClosed *atomic.Bool) er
 }
 
 func (b *Bridge) natsToSocket(ctx context.Context, remoteClosed *atomic.Bool) error {
+	var (
+		batch      net.Buffers
+		batchBytes int
+	)
+
+	flush := func() error {
+		if batchBytes == 0 {
+			return nil
+		}
+
+		if _, err := batch.WriteTo(b.Conn); err != nil {
+			return err
+		}
+
+		clear(batch)
+		batch = batch[:0]
+		batchBytes = 0
+		return nil
+	}
+
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case payload, ok := <-b.Incoming:
-			if !ok {
-				return nil
-			}
+		payload, ok, err := b.waitForIncoming(ctx)
+		if err != nil {
+			return err
+		}
 
-			if len(payload) == 0 {
-				continue
-			}
+		if !ok {
+			return flush()
+		}
 
-			switch payload[0] {
-			case FrameData:
-				if err := writeFull(b.Conn, payload[1:]); err != nil {
-					return err
+		if len(payload) == 0 {
+			continue
+		}
+
+		switch payload[0] {
+		case FrameData:
+			batch = append(batch, payload[1:])
+			batchBytes += len(payload) - 1
+		case FrameEOF:
+			remoteClosed.Store(true)
+			if err := flush(); err != nil {
+				return err
+			}
+			return nil
+		default:
+			return fmt.Errorf("unknown frame type %q", payload[0])
+		}
+
+		if b.WriteCoalesceDelay <= 0 || batchBytes >= b.WriteBatchBytes {
+			if err := flush(); err != nil {
+				return err
+			}
+			continue
+		}
+
+		timer := time.NewTimer(b.WriteCoalesceDelay)
+	collect:
+		for batchBytes < b.WriteBatchBytes {
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
 				}
-			case FrameEOF:
-				remoteClosed.Store(true)
-				return nil
-			default:
-				return fmt.Errorf("unknown frame type %q", payload[0])
+				return ctx.Err()
+			case <-timer.C:
+				break collect
+			case payload, ok := <-b.Incoming:
+				if !ok {
+					if err := flush(); err != nil {
+						return err
+					}
+					return nil
+				}
+
+				if len(payload) == 0 {
+					continue
+				}
+
+				switch payload[0] {
+				case FrameData:
+					batch = append(batch, payload[1:])
+					batchBytes += len(payload) - 1
+				case FrameEOF:
+					remoteClosed.Store(true)
+					if !timer.Stop() {
+						<-timer.C
+					}
+					if err := flush(); err != nil {
+						return err
+					}
+					return nil
+				default:
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return fmt.Errorf("unknown frame type %q", payload[0])
+				}
 			}
+		}
+
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+
+		if err := flush(); err != nil {
+			return err
 		}
 	}
 }
 
-func writeFull(conn net.Conn, payload []byte) error {
-	for len(payload) > 0 {
-		written, err := conn.Write(payload)
-		if err != nil {
-			return err
+func (b *Bridge) coalesceSocketRead(buf []byte, initial int) (int, error) {
+	if err := b.Conn.SetReadDeadline(time.Now().Add(b.ReadCoalesceDelay)); err != nil {
+		return initial, nil
+	}
+	defer b.Conn.SetReadDeadline(time.Time{})
+
+	total := initial
+	for total < len(buf) {
+		n, err := b.Conn.Read(buf[total:])
+		total += n
+
+		if err == nil {
+			continue
 		}
-		payload = payload[written:]
+
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			return total, nil
+		}
+
+		return total, err
 	}
 
-	return nil
+	return total, nil
+}
+
+func (b *Bridge) waitForIncoming(ctx context.Context) ([]byte, bool, error) {
+	select {
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	case payload, ok := <-b.Incoming:
+		return payload, ok, nil
+	}
 }

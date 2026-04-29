@@ -10,14 +10,9 @@ import (
 )
 
 func ConnectNATS(cfg config.NATSConfig, logger *log.Logger) (*nats.Conn, error) {
-	password, err := cfg.ResolvedPassword()
-	if err != nil {
-		return nil, err
-	}
-
 	options := []nats.Option{
 		nats.Name(cfg.Name),
-		nats.UserInfo(cfg.Username, password),
+		nats.UserInfo(cfg.Username, cfg.Password),
 		nats.Timeout(cfg.ConnectTimeout.Duration),
 		nats.MaxReconnects(cfg.MaxReconnects),
 		nats.ReconnectWait(cfg.ReconnectWait.Duration),

@@ -116,8 +116,14 @@ func (w *Worker) handleConnect(ctx context.Context, msg *nats.Msg) {
 		return
 	}
 
-	w.reply(msg, "OK")
+	if err := msg.Respond([]byte("OK")); err != nil {
+		_ = conn.Close()
+		w.unregister(req.CID)
+		w.logger.Printf("[%s] connect reply failed: %v", req.CID, err)
+		return
+	}
 	w.logger.Printf("[%s] proxying %s:%d", req.CID, req.Host, req.Port)
+	downSubject := tunnel.DownSubject(w.cfg.Tunnel.SubjectPrefix, req.CID)
 
 	w.wg.Add(1)
 	go func() {
@@ -125,11 +131,14 @@ func (w *Worker) handleConnect(ctx context.Context, msg *nats.Msg) {
 		defer w.unregister(req.CID)
 
 		bridge := tunnel.Bridge{
-			Conn:      conn,
-			Incoming:  remote.inbound,
-			ChunkSize: w.cfg.Tunnel.ChunkSizeBytes,
+			Conn:               conn,
+			Incoming:           remote.inbound,
+			ChunkSize:          w.cfg.Tunnel.ChunkSizeBytes,
+			ReadCoalesceDelay:  w.cfg.Tunnel.ReadCoalesceDelay.Duration,
+			WriteCoalesceDelay: w.cfg.Tunnel.WriteCoalesceDelay.Duration,
+			WriteBatchBytes:    w.cfg.Tunnel.WriteBatchBytes,
 			Publish: func(frame []byte) error {
-				return w.nc.Publish(tunnel.DownSubject(w.cfg.Tunnel.SubjectPrefix, req.CID), frame)
+				return w.nc.Publish(downSubject, frame)
 			},
 		}
 

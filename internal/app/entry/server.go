@@ -167,13 +167,17 @@ func (s *Server) serveClient(ctx context.Context, conn net.Conn) {
 	}
 
 	s.logger.Printf("[%s] proxying %s:%d", sessionID, addr.Host, addr.Port)
+	upSubject := tunnel.UpSubject(s.cfg.Tunnel.SubjectPrefix, sessionID)
 
 	bridge := tunnel.Bridge{
-		Conn:      conn,
-		Incoming:  client.inbound,
-		ChunkSize: s.cfg.Tunnel.ChunkSizeBytes,
+		Conn:               conn,
+		Incoming:           client.inbound,
+		ChunkSize:          s.cfg.Tunnel.ChunkSizeBytes,
+		ReadCoalesceDelay:  s.cfg.Tunnel.ReadCoalesceDelay.Duration,
+		WriteCoalesceDelay: s.cfg.Tunnel.WriteCoalesceDelay.Duration,
+		WriteBatchBytes:    s.cfg.Tunnel.WriteBatchBytes,
 		Publish: func(frame []byte) error {
-			return s.nc.Publish(tunnel.UpSubject(s.cfg.Tunnel.SubjectPrefix, sessionID), frame)
+			return s.nc.Publish(upSubject, frame)
 		},
 	}
 

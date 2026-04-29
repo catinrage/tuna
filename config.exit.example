@@ -2,7 +2,7 @@
   "nats": {
     "url": "nats://127.0.0.1:4222",
     "username": "nats_client",
-    "password_env": "NATS_PASSWORD",
+    "password": "change-me",
     "name": "tuna-exit",
     "connect_timeout": "5s",
     "reconnect_wait": "1s",
@@ -13,14 +13,17 @@
   },
   "tunnel": {
     "subject_prefix": "tuna",
-    "chunk_size_bytes": 262144,
-    "session_queue_depth": 1024,
+    "chunk_size_bytes": 524288,
+    "read_coalesce_delay": "250us",
+    "write_coalesce_delay": "250us",
+    "write_batch_bytes": 1048576,
+    "session_queue_depth": 2048,
     "subscription_pending_messages": 262144,
-    "subscription_pending_bytes": 268435456,
+    "subscription_pending_bytes": 536870912,
     "tcp_no_delay": true,
     "tcp_keep_alive": "30s",
-    "tcp_read_buffer_bytes": 1048576,
-    "tcp_write_buffer_bytes": 1048576
+    "tcp_read_buffer_bytes": 4194304,
+    "tcp_write_buffer_bytes": 4194304
   },
   "exit": {
     "dial_timeout": "10s"

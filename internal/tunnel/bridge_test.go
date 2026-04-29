@@ -19,9 +19,10 @@ func TestBridgeRunCopiesSocketToPublisherAndBack(t *testing.T) {
 	incoming := make(chan []byte, 2)
 	published := make(chan []byte, 2)
 	bridge := Bridge{
-		Conn:      local,
-		Incoming:  incoming,
-		ChunkSize: 32,
+		Conn:            local,
+		Incoming:        incoming,
+		ChunkSize:       32,
+		WriteBatchBytes: 32,
 		Publish: func(payload []byte) error {
 			published <- append([]byte(nil), payload...)
 			return nil
@@ -85,9 +86,10 @@ func TestBridgePublishesEOFOnSocketClose(t *testing.T) {
 	frames := make([][]byte, 0, 2)
 
 	bridge := Bridge{
-		Conn:      local,
-		Incoming:  incoming,
-		ChunkSize: 32,
+		Conn:            local,
+		Incoming:        incoming,
+		ChunkSize:       32,
+		WriteBatchBytes: 32,
 		Publish: func(payload []byte) error {
 			mu.Lock()
 			defer mu.Unlock()
@@ -126,10 +128,11 @@ func TestBridgeRunPropagatesUnknownFrameError(t *testing.T) {
 
 	incoming := make(chan []byte, 1)
 	bridge := Bridge{
-		Conn:      local,
-		Incoming:  incoming,
-		ChunkSize: 32,
-		Publish:   func(payload []byte) error { return nil },
+		Conn:            local,
+		Incoming:        incoming,
+		ChunkSize:       32,
+		WriteBatchBytes: 32,
+		Publish:         func(payload []byte) error { return nil },
 	}
 
 	errCh := make(chan error, 1)
@@ -148,5 +151,54 @@ func TestBridgeRunPropagatesUnknownFrameError(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for bridge error")
+	}
+}
+
+func TestBridgeCoalescesSocketReads(t *testing.T) {
+	local, peer := net.Pipe()
+	defer local.Close()
+	defer peer.Close()
+
+	incoming := make(chan []byte, 1)
+	published := make(chan []byte, 2)
+	bridge := Bridge{
+		Conn:              local,
+		Incoming:          incoming,
+		ChunkSize:         32,
+		ReadCoalesceDelay: 5 * time.Millisecond,
+		WriteBatchBytes:   32,
+		Publish: func(payload []byte) error {
+			published <- append([]byte(nil), payload...)
+			return nil
+		},
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- bridge.Run(context.Background())
+	}()
+
+	go func() {
+		_, _ = peer.Write([]byte("hello"))
+		_, _ = peer.Write([]byte("world"))
+		_ = peer.Close()
+	}()
+
+	select {
+	case frame := <-published:
+		if got, want := string(frame[1:]), "helloworld"; got != want {
+			t.Fatalf("coalesced frame payload = %q, want %q", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for coalesced publish")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("bridge run error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for bridge shutdown")
 	}
 }
