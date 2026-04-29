@@ -1,0 +1,29 @@
+{
+  "nats": {
+    "url": "nats://127.0.0.1:4222",
+    "username": "nats_client",
+    "password_env": "NATS_PASSWORD",
+    "name": "tuna-entry",
+    "connect_timeout": "5s",
+    "reconnect_wait": "1s",
+    "ping_interval": "20s",
+    "max_pings_outstanding": 5,
+    "max_reconnects": -1,
+    "reconnect_buffer_bytes": 67108864
+  },
+  "tunnel": {
+    "subject_prefix": "tuna",
+    "chunk_size_bytes": 262144,
+    "session_queue_depth": 1024,
+    "subscription_pending_messages": 262144,
+    "subscription_pending_bytes": 268435456,
+    "tcp_no_delay": true,
+    "tcp_keep_alive": "30s",
+    "tcp_read_buffer_bytes": 1048576,
+    "tcp_write_buffer_bytes": 1048576
+  },
+  "entry": {
+    "listen_address": "127.0.0.1:1080",
+    "request_timeout": "10s"
+  }
+}
