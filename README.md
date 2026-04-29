@@ -63,6 +63,13 @@ The files are JSON. Copy them to the filenames you want and pass them with `-con
 /usr/local/go/bin/go build ./...
 ```
 
+## Test
+
+```bash
+/usr/local/go/bin/go test ./...
+/usr/local/go/bin/go test -race ./...
+```
+
 ## Run
 
 Start the exit worker first:
@@ -112,6 +119,11 @@ Frames are 1 byte of type plus payload:
 - The NATS password is intentionally sourced from an environment variable by default.
 - `chunk_size_bytes` must stay below the NATS server `max_payload` setting.
 - If you push very large downloads, tune `chunk_size_bytes`, socket buffers, and NATS pending limits together.
+
+## Automation
+
+- `.github/workflows/test.yml` runs formatting checks, unit tests, and a full build on pushes to `main` and pull requests.
+- `.github/workflows/release.yml` builds release archives for Linux, macOS, and Windows when a `v*` tag is pushed, then publishes them as GitHub release assets.
 
 ## Repository layout
 
