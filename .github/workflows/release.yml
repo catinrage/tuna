@@ -2,6 +2,8 @@ name: release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -10,23 +12,62 @@ permissions:
   contents: write
 
 jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag_name: ${{ steps.meta.outputs.tag_name }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      build_date: ${{ steps.meta.outputs.build_date }}
+    steps:
+      - name: Compute version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHORT_SHA="${GITHUB_SHA::7}"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+            TAG_NAME="${GITHUB_REF_NAME}"
+            PRERELEASE="false"
+          else
+            VERSION="0.0.${GITHUB_RUN_NUMBER}-${SHORT_SHA}"
+            TAG_NAME="build-${GITHUB_RUN_NUMBER}-${SHORT_SHA}"
+            PRERELEASE="true"
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
+
   verify:
+    needs: meta
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23.x'
+          go-version-file: go.mod
           cache: true
 
       - name: Run tests
         run: go test ./...
 
   build:
-    needs: verify
+    needs:
+      - meta
+      - verify
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -47,38 +88,50 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23.x'
+          go-version-file: go.mod
           cache: true
 
       - name: Build archives
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          SHORT_SHA: ${{ needs.meta.outputs.short_sha }}
+          BUILD_DATE: ${{ needs.meta.outputs.build_date }}
+        shell: bash
         run: |
+          set -euo pipefail
+
           ext=""
           if [ "$GOOS" = "windows" ]; then
             ext=".exe"
           fi
 
-          outdir="dist/tuna_${GOOS}_${GOARCH}"
+          archive_base="tuna_${VERSION}_${GOOS}_${GOARCH}"
+          outdir="dist/${archive_base}"
           mkdir -p "$outdir"
 
-          go build -trimpath -ldflags='-s -w' -o "$outdir/tuna-entry${ext}" ./cmd/tuna-entry
-          go build -trimpath -ldflags='-s -w' -o "$outdir/tuna-exit${ext}" ./cmd/tuna-exit
+          ldflags="-s -w"
+
+          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -ldflags "$ldflags" -o "$outdir/tuna-entry${ext}" ./cmd/tuna-entry
+          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -ldflags "$ldflags" -o "$outdir/tuna-exit${ext}" ./cmd/tuna-exit
 
           cp README.md "$outdir/README.md"
           cp config.entry.example "$outdir/config.entry.example"
           cp config.exit.example "$outdir/config.exit.example"
 
-          archive="tuna_${GOOS}_${GOARCH}"
           if [ "$GOOS" = "windows" ]; then
-            (cd dist && zip -r "${archive}.zip" "$(basename "$outdir")")
+            (cd dist && zip -r "${archive_base}.zip" "${archive_base}")
+            sha256sum "dist/${archive_base}.zip" > "dist/${archive_base}.zip.sha256"
           else
-            tar -C dist -czf "dist/${archive}.tar.gz" "$(basename "$outdir")"
+            tar -C dist -czf "dist/${archive_base}.tar.gz" "${archive_base}"
+            sha256sum "dist/${archive_base}.tar.gz" > "dist/${archive_base}.tar.gz.sha256"
           fi
 
       - name: Upload build artifacts
@@ -87,12 +140,15 @@ jobs:
           name: tuna-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
             dist/*.tar.gz
+            dist/*.tar.gz.sha256
             dist/*.zip
+            dist/*.zip.sha256
 
   publish:
-    needs: build
+    needs:
+      - meta
+      - build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -103,7 +159,13 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.meta.outputs.tag_name }}
+          name: ${{ needs.meta.outputs.version }}
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.meta.outputs.prerelease != 'true' }}
           files: |
             dist/*.tar.gz
+            dist/*.tar.gz.sha256
             dist/*.zip
+            dist/*.zip.sha256
           generate_release_notes: true

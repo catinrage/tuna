@@ -146,7 +146,7 @@ Overall expectation if the broker is not CPU-throttled:
 ## Automation
 
 - `.github/workflows/test.yml` runs formatting checks, unit tests, and a full build on pushes to `main` and pull requests.
-- `.github/workflows/release.yml` builds release archives for Linux, macOS, and Windows when a `v*` tag is pushed, then publishes them as GitHub release assets.
+- `.github/workflows/release.yml` builds release archives for Linux, macOS, and Windows on every push to `main` and publishes them as GitHub prereleases. Real `v*` tags are still published as normal releases.
 
 ## Repository layout
 
