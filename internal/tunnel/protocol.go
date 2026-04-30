@@ -21,12 +21,23 @@ func ConnectSubject(prefix string) string {
 	return prefix + ".connect"
 }
 
-func UpSubject(prefix string) string {
-	return prefix + ".up"
+func UpSubject(prefix string, shard int) string {
+	return fmt.Sprintf("%s.up.%02d", prefix, shard)
 }
 
-func DownSubject(prefix string) string {
-	return prefix + ".down"
+func DownSubject(prefix string, shard int) string {
+	return fmt.Sprintf("%s.down.%02d", prefix, shard)
+}
+
+func DataShard(sessionID uint64, shardCount int) int {
+	if shardCount <= 1 {
+		return 0
+	}
+	return int(sessionID % uint64(shardCount))
+}
+
+func FrameBufferSize(payloadSize int) int {
+	return frameHeaderSize + payloadSize
 }
 
 func DataFrame(buf []byte, sessionID uint64, n int) []byte {

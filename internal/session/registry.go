@@ -1,15 +1,18 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"sync"
+	"time"
 )
 
 var ErrSessionExists = errors.New("session already exists")
 
 type Sink interface {
-	Enqueue(payload []byte) bool
+	Enqueue(ctx context.Context, frame *Frame) error
 	Close()
+	LastActive() time.Time
 }
 
 type Registry struct {
@@ -42,16 +45,19 @@ func (r *Registry) Remove(id uint64) Sink {
 	return sink
 }
 
-func (r *Registry) Deliver(id uint64, payload []byte) bool {
+func (r *Registry) Deliver(ctx context.Context, id uint64, frame *Frame) error {
 	r.mu.RLock()
 	sink := r.sessions[id]
 	r.mu.RUnlock()
 
 	if sink == nil {
-		return false
+		if frame != nil {
+			frame.Release()
+		}
+		return ErrQueueClosed
 	}
 
-	return sink.Enqueue(payload)
+	return sink.Enqueue(ctx, frame)
 }
 
 func (r *Registry) CloseAll() {
@@ -66,4 +72,25 @@ func (r *Registry) CloseAll() {
 	for _, sink := range sinks {
 		sink.Close()
 	}
+}
+
+func (r *Registry) CloseIdle(cutoff time.Time) int {
+	r.mu.Lock()
+	ids := make([]uint64, 0)
+	sinks := make([]Sink, 0)
+	for id, sink := range r.sessions {
+		if sink.LastActive().Before(cutoff) {
+			ids = append(ids, id)
+			sinks = append(sinks, sink)
+		}
+	}
+	for _, id := range ids {
+		delete(r.sessions, id)
+	}
+	r.mu.Unlock()
+
+	for _, sink := range sinks {
+		sink.Close()
+	}
+	return len(sinks)
 }

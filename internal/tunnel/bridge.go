@@ -9,34 +9,43 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"tuna/internal/session"
 )
 
 type Publisher func(payload []byte) error
 
 type Bridge struct {
-	SessionID          uint64
-	Conn               net.Conn
-	Incoming           <-chan []byte
-	Publish            Publisher
-	ChunkSize          int
-	ReadCoalesceDelay  time.Duration
-	WriteCoalesceDelay time.Duration
-	WriteBatchBytes    int
+	SessionID             uint64
+	Conn                  net.Conn
+	Incoming              *session.Queue
+	Publish               Publisher
+	FramePool             *FramePool
+	ChunkSize             int
+	WriteBatchBytes       int
+	ReadCoalesceMinDelay  time.Duration
+	ReadCoalesceMaxDelay  time.Duration
+	WriteCoalesceMinDelay time.Duration
+	WriteCoalesceMaxDelay time.Duration
+	OnActivity            func()
 }
 
 func (b *Bridge) Run(ctx context.Context) error {
 	if b.Conn == nil {
 		return errors.New("bridge connection is nil")
 	}
-
 	if b.Publish == nil {
 		return errors.New("bridge publisher is nil")
 	}
-
+	if b.Incoming == nil {
+		return errors.New("bridge incoming queue is nil")
+	}
+	if b.FramePool == nil {
+		return errors.New("bridge frame pool is nil")
+	}
 	if b.ChunkSize <= 0 {
 		return fmt.Errorf("invalid chunk size %d", b.ChunkSize)
 	}
-
 	if b.WriteBatchBytes <= 0 {
 		return fmt.Errorf("invalid write batch size %d", b.WriteBatchBytes)
 	}
@@ -53,10 +62,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 		defer wg.Done()
 		errCh <- b.socketToNATS(ctx, &remoteClosed)
 	}()
-
 	go func() {
 		defer wg.Done()
-		errCh <- b.natsToSocket(ctx, &remoteClosed)
+		errCh <- b.queueToSocket(ctx, &remoteClosed)
 	}()
 
 	firstErr := <-errCh
@@ -64,23 +72,32 @@ func (b *Bridge) Run(ctx context.Context) error {
 	_ = b.Conn.Close()
 	wg.Wait()
 
-	if firstErr != nil && !errors.Is(firstErr, context.Canceled) && !errors.Is(firstErr, net.ErrClosed) {
+	if firstErr != nil && !errors.Is(firstErr, context.Canceled) && !errors.Is(firstErr, net.ErrClosed) && !errors.Is(firstErr, session.ErrQueueClosed) {
 		return firstErr
 	}
-
 	return nil
 }
 
 func (b *Bridge) socketToNATS(ctx context.Context, remoteClosed *atomic.Bool) error {
-	buf := make([]byte, b.ChunkSize+frameHeaderSize)
+	readWindow := NewAdaptiveDelay(b.ReadCoalesceMinDelay, b.ReadCoalesceMaxDelay)
+	buf := b.FramePool.Get()
+	defer b.FramePool.Put(buf)
 
 	for {
-		n, err := b.Conn.Read(buf[frameHeaderSize:])
-		if n > 0 && err == nil && b.ReadCoalesceDelay > 0 && n < b.ChunkSize {
-			n, err = b.coalesceSocketRead(buf[frameHeaderSize:], n)
+		n, err := b.Conn.Read(buf[FrameBufferSize(0):])
+		if n > 0 && err == nil && n < b.ChunkSize && readWindow.Current() > 0 {
+			var coalesced bool
+			n, err, coalesced = b.coalesceSocketRead(buf[FrameBufferSize(0):], n, readWindow.Current())
+			if coalesced {
+				readWindow.Increase()
+			} else {
+				readWindow.Decrease()
+			}
 		}
-
 		if n > 0 {
+			if b.OnActivity != nil {
+				b.OnActivity()
+			}
 			if publishErr := b.Publish(DataFrame(buf, b.SessionID, n)); publishErr != nil {
 				return publishErr
 			}
@@ -89,89 +106,115 @@ func (b *Bridge) socketToNATS(ctx context.Context, remoteClosed *atomic.Bool) er
 		if err == nil {
 			continue
 		}
-
 		if errors.Is(err, io.EOF) {
 			if !remoteClosed.Load() {
 				_ = b.Publish(EOFFrame(b.SessionID))
 			}
 			return nil
 		}
-
 		if ctx.Err() != nil || remoteClosed.Load() || errors.Is(err, net.ErrClosed) {
 			return nil
 		}
-
 		_ = b.Publish(EOFFrame(b.SessionID))
 		return err
 	}
 }
 
-func (b *Bridge) natsToSocket(ctx context.Context, remoteClosed *atomic.Bool) error {
+func (b *Bridge) queueToSocket(ctx context.Context, remoteClosed *atomic.Bool) error {
+	writeWindow := NewAdaptiveDelay(b.WriteCoalesceMinDelay, b.WriteCoalesceMaxDelay)
 	var (
 		batch      net.Buffers
+		held       []*session.Frame
 		batchBytes int
 	)
+
+	releaseHeld := func() {
+		for i, frame := range held {
+			if frame != nil {
+				frame.Release()
+				held[i] = nil
+			}
+		}
+		held = held[:0]
+	}
+	defer releaseHeld()
 
 	flush := func() error {
 		if batchBytes == 0 {
 			return nil
 		}
-
-		if _, err := batch.WriteTo(b.Conn); err != nil {
-			return err
+		_, err := batch.WriteTo(b.Conn)
+		if b.OnActivity != nil {
+			b.OnActivity()
 		}
-
+		releaseHeld()
 		clear(batch)
 		batch = batch[:0]
 		batchBytes = 0
-		return nil
+		return err
+	}
+
+	appendFrame := func(frame *session.Frame) (bool, error) {
+		frameType, err := FrameType(frame.Data)
+		if err != nil {
+			frame.Release()
+			return false, err
+		}
+		if frameType == FrameEOF {
+			frame.Release()
+			remoteClosed.Store(true)
+			return true, nil
+		}
+		if frameType != FrameData {
+			frame.Release()
+			return false, fmt.Errorf("unknown frame type %q", frameType)
+		}
+
+		payload, err := FramePayload(frame.Data)
+		if err != nil {
+			frame.Release()
+			return false, err
+		}
+		batch = append(batch, payload)
+		held = append(held, frame)
+		batchBytes += len(payload)
+		return false, nil
 	}
 
 	for {
-		payload, ok, err := b.waitForIncoming(ctx)
+		frame, err := b.Incoming.Pop(ctx)
 		if err != nil {
+			if errors.Is(err, session.ErrQueueClosed) {
+				return flush()
+			}
 			return err
 		}
-
-		if !ok {
-			return flush()
-		}
-
-		if len(payload) == 0 {
+		if frame == nil {
 			continue
 		}
 
-		frameType, err := FrameType(payload)
+		eof, err := appendFrame(frame)
 		if err != nil {
 			return err
 		}
-
-		switch frameType {
-		case FrameData:
-			framePayload, frameErr := FramePayload(payload)
-			if frameErr != nil {
-				return frameErr
-			}
-			batch = append(batch, framePayload)
-			batchBytes += len(framePayload)
-		case FrameEOF:
-			remoteClosed.Store(true)
+		if eof {
 			if err := flush(); err != nil {
 				return err
 			}
 			return nil
-		default:
-			return fmt.Errorf("unknown frame type %q", frameType)
 		}
 
-		if b.WriteCoalesceDelay <= 0 || batchBytes >= b.WriteBatchBytes {
+		delay := writeWindow.Current()
+		if delay <= 0 || batchBytes >= b.WriteBatchBytes {
 			if err := flush(); err != nil {
 				return err
 			}
+			writeWindow.Increase()
 			continue
 		}
 
-		timer := time.NewTimer(b.WriteCoalesceDelay)
+		timer := time.NewTimer(delay)
+		gathered := false
 	collect:
 		for batchBytes < b.WriteBatchBytes {
 			select {
@@ -182,52 +225,43 @@ func (b *Bridge) natsToSocket(ctx context.Context, remoteClosed *atomic.Bool) er
 				return ctx.Err()
 			case <-timer.C:
 				break collect
-			case payload, ok := <-b.Incoming:
-				if !ok {
-					if err := flush(); err != nil {
-						return err
-					}
-					return nil
-				}
+			default:
+			}
 
-				if len(payload) == 0 {
-					continue
+			frame, ok, popErr := b.Incoming.TryPop()
+			if popErr != nil {
+				if errors.Is(popErr, session.ErrQueueClosed) {
+					break collect
 				}
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return popErr
+			}
+			if !ok {
+				time.Sleep(10 * time.Microsecond)
+				continue
+			}
 
-				frameType, err := FrameType(payload)
-				if err != nil {
-					if !timer.Stop() {
-						<-timer.C
+			gathered = true
+			eof, err := appendFrame(frame)
+			if err != nil {
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return err
+			}
+			if eof {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
 					}
+				}
+				if err := flush(); err != nil {
 					return err
 				}
-
-				switch frameType {
-				case FrameData:
-					framePayload, frameErr := FramePayload(payload)
-					if frameErr != nil {
-						if !timer.Stop() {
-							<-timer.C
-						}
-						return frameErr
-					}
-					batch = append(batch, framePayload)
-					batchBytes += len(framePayload)
-				case FrameEOF:
-					remoteClosed.Store(true)
-					if !timer.Stop() {
-						<-timer.C
-					}
-					if err := flush(); err != nil {
-						return err
-					}
-					return nil
-				default:
-					if !timer.Stop() {
-						<-timer.C
-					}
-					return fmt.Errorf("unknown frame type %q", frameType)
-				}
+				return nil
 			}
 		}
 
@@ -241,39 +275,35 @@ func (b *Bridge) natsToSocket(ctx context.Context, remoteClosed *atomic.Bool) er
 		if err := flush(); err != nil {
 			return err
 		}
+		if gathered {
+			writeWindow.Increase()
+		} else {
+			writeWindow.Decrease()
+		}
 	}
 }
 
-func (b *Bridge) coalesceSocketRead(buf []byte, initial int) (int, error) {
-	if err := b.Conn.SetReadDeadline(time.Now().Add(b.ReadCoalesceDelay)); err != nil {
-		return initial, nil
+func (b *Bridge) coalesceSocketRead(buf []byte, initial int, delay time.Duration) (int, error, bool) {
+	if err := b.Conn.SetReadDeadline(time.Now().Add(delay)); err != nil {
+		return initial, nil, false
 	}
 	defer b.Conn.SetReadDeadline(time.Time{})
 
 	total := initial
+	coalesced := false
 	for total < len(buf) {
 		n, err := b.Conn.Read(buf[total:])
 		total += n
-
+		if n > 0 {
+			coalesced = true
+		}
 		if err == nil {
 			continue
 		}
-
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return total, nil
+			return total, nil, coalesced
 		}
-
-		return total, err
+		return total, err, coalesced
 	}
-
-	return total, nil
-}
-
-func (b *Bridge) waitForIncoming(ctx context.Context) ([]byte, bool, error) {
-	select {
-	case <-ctx.Done():
-		return nil, false, ctx.Err()
-	case payload, ok := <-b.Incoming:
-		return payload, ok, nil
-	}
+	return total, nil, coalesced
 }

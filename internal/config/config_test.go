@@ -56,11 +56,17 @@ func TestLoadEntryAppliesDefaultsAndOverrides(t *testing.T) {
 	if got, want := cfg.Entry.RequestTimeout.Duration, 10*time.Second; got != want {
 		t.Fatalf("request_timeout = %v, want %v", got, want)
 	}
+	if got, want := cfg.Tunnel.DataSubjectShards, 16; got != want {
+		t.Fatalf("data_subject_shards = %d, want %d", got, want)
+	}
 	if got, want := cfg.Tunnel.ChunkSizeBytes, 512<<10; got != want {
 		t.Fatalf("chunk_size_bytes = %d, want %d", got, want)
 	}
-	if got, want := cfg.Tunnel.ReadCoalesceDelay.Duration, 250*time.Microsecond; got != want {
-		t.Fatalf("read_coalesce_delay = %v, want %v", got, want)
+	if got, want := cfg.Tunnel.ReadCoalesceMinDelay.Duration, 50*time.Microsecond; got != want {
+		t.Fatalf("read_coalesce_min_delay = %v, want %v", got, want)
+	}
+	if got, want := cfg.Tunnel.ReadCoalesceMaxDelay.Duration, 500*time.Microsecond; got != want {
+		t.Fatalf("read_coalesce_max_delay = %v, want %v", got, want)
 	}
 	if got, want := cfg.Tunnel.WriteBatchBytes, 1<<20; got != want {
 		t.Fatalf("write_batch_bytes = %d, want %d", got, want)

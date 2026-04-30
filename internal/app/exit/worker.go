@@ -3,12 +3,14 @@ package exit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/nats-io/nats.go"
 
@@ -18,61 +20,79 @@ import (
 )
 
 type Worker struct {
-	cfg      config.ExitConfig
-	logger   *log.Logger
-	nc       *nats.Conn
-	registry *session.Registry
-	wg       sync.WaitGroup
+	cfg       config.ExitConfig
+	logger    *log.Logger
+	control   *nats.Conn
+	data      *nats.Conn
+	registry  *session.Registry
+	framePool *tunnel.FramePool
+	wg        sync.WaitGroup
 }
 
 type remoteSession struct {
 	conn     net.Conn
-	inbound  chan []byte
+	inbound  *session.Queue
 	closed   atomic.Bool
 	closeOne sync.Once
 }
 
 func New(cfg config.ExitConfig, logger *log.Logger) *Worker {
 	return &Worker{
-		cfg:      cfg,
-		logger:   logger,
-		registry: session.NewRegistry(),
+		cfg:       cfg,
+		logger:    logger,
+		registry:  session.NewRegistry(),
+		framePool: tunnel.NewFramePool(tunnel.FrameBufferSize(cfg.Tunnel.ChunkSizeBytes)),
 	}
 }
 
 func (w *Worker) Run(ctx context.Context) error {
-	nc, err := tunnel.ConnectNATS(w.cfg.NATS, w.logger)
+	control, err := tunnel.ConnectNATS(w.cfg.NATS, w.logger, "exit-control")
 	if err != nil {
 		return err
 	}
-	w.nc = nc
-	defer nc.Drain()
-
-	upstreamSub, err := nc.Subscribe(tunnel.UpSubject(w.cfg.Tunnel.SubjectPrefix), w.handleUpstream)
+	data, err := tunnel.ConnectNATS(w.cfg.NATS, w.logger, "exit-data")
 	if err != nil {
-		return fmt.Errorf("subscribe upstream: %w", err)
+		_ = control.Drain()
+		return err
+	}
+	w.control = control
+	w.data = data
+	defer control.Drain()
+	defer data.Drain()
+
+	for shard := 0; shard < w.cfg.Tunnel.DataSubjectShards; shard++ {
+		sub, subErr := data.Subscribe(tunnel.UpSubject(w.cfg.Tunnel.SubjectPrefix, shard), w.handleUpstream)
+		if subErr != nil {
+			return fmt.Errorf("subscribe upstream shard %d: %w", shard, subErr)
+		}
+		if err := sub.SetPendingLimits(w.cfg.Tunnel.SubscriptionPendingMessages, w.cfg.Tunnel.SubscriptionPendingBytes); err != nil {
+			return fmt.Errorf("set upstream pending limits for shard %d: %w", shard, err)
+		}
 	}
 
-	if err := upstreamSub.SetPendingLimits(w.cfg.Tunnel.SubscriptionPendingMessages, w.cfg.Tunnel.SubscriptionPendingBytes); err != nil {
-		return fmt.Errorf("set upstream pending limits: %w", err)
-	}
-
-	connectSub, err := nc.Subscribe(tunnel.ConnectSubject(w.cfg.Tunnel.SubjectPrefix), func(msg *nats.Msg) {
-		w.handleConnect(ctx, msg)
+	connectSub, err := control.Subscribe(tunnel.ConnectSubject(w.cfg.Tunnel.SubjectPrefix), func(msg *nats.Msg) {
+		w.wg.Add(1)
+		go func() {
+			defer w.wg.Done()
+			w.handleConnect(ctx, msg)
+		}()
 	})
 	if err != nil {
 		return fmt.Errorf("subscribe connect subject: %w", err)
 	}
-
 	if err := connectSub.SetPendingLimits(w.cfg.Tunnel.SubscriptionPendingMessages, w.cfg.Tunnel.SubscriptionPendingBytes); err != nil {
 		return fmt.Errorf("set connect pending limits: %w", err)
 	}
 
-	if err := nc.FlushTimeout(w.cfg.NATS.ConnectTimeout.Duration); err != nil {
-		return fmt.Errorf("flush subscriptions: %w", err)
+	if err := data.FlushTimeout(w.cfg.NATS.ConnectTimeout.Duration); err != nil {
+		return fmt.Errorf("flush upstream subscriptions: %w", err)
+	}
+	if err := control.FlushTimeout(w.cfg.NATS.ConnectTimeout.Duration); err != nil {
+		return fmt.Errorf("flush control subscriptions: %w", err)
 	}
 
 	w.logger.Printf("exit worker ready")
+	go w.cleanupIdleSessions(ctx)
 
 	<-ctx.Done()
 	w.registry.CloseAll()
@@ -105,9 +125,8 @@ func (w *Worker) handleConnect(ctx context.Context, msg *nats.Msg) {
 
 	remote := &remoteSession{
 		conn:    conn,
-		inbound: make(chan []byte, w.cfg.Tunnel.SessionQueueDepth),
+		inbound: session.NewQueue(w.cfg.Tunnel.SessionQueueDepth, w.cfg.Tunnel.QueueBackpressureTimeout.Duration),
 	}
-
 	if err := w.registry.Add(req.CID, remote); err != nil {
 		_ = conn.Close()
 		w.reply(msg, "ERR duplicate session")
@@ -121,8 +140,10 @@ func (w *Worker) handleConnect(ctx context.Context, msg *nats.Msg) {
 		w.logger.Printf("[%016x] connect reply failed: %v", req.CID, err)
 		return
 	}
-	w.logger.Printf("[%016x] proxying %s:%d", req.CID, req.Host, req.Port)
-	downSubject := tunnel.DownSubject(w.cfg.Tunnel.SubjectPrefix)
+
+	shard := tunnel.DataShard(req.CID, w.cfg.Tunnel.DataSubjectShards)
+	downSubject := tunnel.DownSubject(w.cfg.Tunnel.SubjectPrefix, shard)
+	w.logger.Printf("[%016x] proxying %s:%d on shard %02d", req.CID, req.Host, req.Port, shard)
 
 	w.wg.Add(1)
 	go func() {
@@ -130,16 +151,18 @@ func (w *Worker) handleConnect(ctx context.Context, msg *nats.Msg) {
 		defer w.unregister(req.CID)
 
 		bridge := tunnel.Bridge{
-			SessionID:          req.CID,
-			Conn:               conn,
-			Incoming:           remote.inbound,
-			ChunkSize:          w.cfg.Tunnel.ChunkSizeBytes,
-			ReadCoalesceDelay:  w.cfg.Tunnel.ReadCoalesceDelay.Duration,
-			WriteCoalesceDelay: w.cfg.Tunnel.WriteCoalesceDelay.Duration,
-			WriteBatchBytes:    w.cfg.Tunnel.WriteBatchBytes,
-			Publish: func(frame []byte) error {
-				return w.nc.Publish(downSubject, frame)
-			},
+			SessionID:             req.CID,
+			Conn:                  conn,
+			Incoming:              remote.inbound,
+			Publish:               func(frame []byte) error { return w.data.Publish(downSubject, frame) },
+			FramePool:             w.framePool,
+			ChunkSize:             w.cfg.Tunnel.ChunkSizeBytes,
+			WriteBatchBytes:       w.cfg.Tunnel.WriteBatchBytes,
+			ReadCoalesceMinDelay:  w.cfg.Tunnel.ReadCoalesceMinDelay.Duration,
+			ReadCoalesceMaxDelay:  w.cfg.Tunnel.ReadCoalesceMaxDelay.Duration,
+			WriteCoalesceMinDelay: w.cfg.Tunnel.WriteCoalesceMinDelay.Duration,
+			WriteCoalesceMaxDelay: w.cfg.Tunnel.WriteCoalesceMaxDelay.Duration,
+			OnActivity:            remote.inbound.Touch,
 		}
 
 		if bridgeErr := bridge.Run(ctx); bridgeErr != nil {
@@ -158,7 +181,11 @@ func (w *Worker) handleUpstream(msg *nats.Msg) {
 		return
 	}
 
-	if delivered := w.registry.Deliver(sessionID, msg.Data); !delivered {
+	frame := session.NewFrame(w.framePool.Clone(msg.Data), w.framePool.Put)
+	if err := w.registry.Deliver(context.Background(), sessionID, frame); err != nil {
+		if !errors.Is(err, session.ErrQueueClosed) {
+			w.logger.Printf("[%016x] upstream delivery failed: %v", sessionID, err)
+		}
 		if sink := w.registry.Remove(sessionID); sink != nil {
 			sink.Close()
 		}
@@ -177,23 +204,39 @@ func (w *Worker) reply(msg *nats.Msg, payload string) {
 	}
 }
 
-func (r *remoteSession) Enqueue(payload []byte) bool {
+func (r *remoteSession) Enqueue(ctx context.Context, frame *session.Frame) error {
 	if r.closed.Load() {
-		return false
+		frame.Release()
+		return session.ErrQueueClosed
 	}
-
-	select {
-	case r.inbound <- payload:
-		return true
-	default:
-		return false
-	}
+	return r.inbound.Push(ctx, frame)
 }
 
 func (r *remoteSession) Close() {
 	r.closeOne.Do(func() {
 		r.closed.Store(true)
 		_ = r.conn.Close()
-		close(r.inbound)
+		r.inbound.Close()
 	})
+}
+
+func (r *remoteSession) LastActive() time.Time {
+	return r.inbound.LastActive()
+}
+
+func (w *Worker) cleanupIdleSessions(ctx context.Context) {
+	ticker := time.NewTicker(w.cfg.Tunnel.CleanupInterval.Duration)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().Add(-w.cfg.Tunnel.SessionIdleTimeout.Duration)
+			if closed := w.registry.CloseIdle(cutoff); closed > 0 {
+				w.logger.Printf("closed %d idle exit sessions", closed)
+			}
+		}
+	}
 }

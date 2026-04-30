@@ -9,17 +9,20 @@ func TestSubjectHelpers(t *testing.T) {
 	if got, want := ConnectSubject("tuna"), "tuna.connect"; got != want {
 		t.Fatalf("connect subject = %q, want %q", got, want)
 	}
-	if got, want := UpSubject("tuna"), "tuna.up"; got != want {
+	if got, want := UpSubject("tuna", 3), "tuna.up.03"; got != want {
 		t.Fatalf("up subject = %q, want %q", got, want)
 	}
-	if got, want := DownSubject("tuna"), "tuna.down"; got != want {
+	if got, want := DownSubject("tuna", 12), "tuna.down.12"; got != want {
 		t.Fatalf("down subject = %q, want %q", got, want)
+	}
+	if got, want := DataShard(42, 16), 10; got != want {
+		t.Fatalf("data shard = %d, want %d", got, want)
 	}
 }
 
 func TestDataAndEOFFrames(t *testing.T) {
-	buf := make([]byte, frameHeaderSize+4)
-	copy(buf[frameHeaderSize:], []byte("test"))
+	buf := make([]byte, FrameBufferSize(4))
+	copy(buf[FrameBufferSize(0):], []byte("test"))
 	frame := DataFrame(buf, 42, 4)
 
 	kind, err := FrameType(frame)

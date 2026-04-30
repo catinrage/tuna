@@ -7,7 +7,7 @@ It keeps the MVP architecture intact:
 - `tuna-entry` exposes a local SOCKS5 proxy.
 - `tuna-exit` receives connect requests over NATS and opens the real outbound TCP connections.
 
-The rewrite changes the implementation strategy to reduce per-connection overhead and keep the hot path simple.
+The rewrite changes the implementation strategy to reduce broker overhead, lower connect-path interference, and keep the data path cheap under sustained downloads.
 
 ## Architecture
 
@@ -36,14 +36,16 @@ remote target
 Compared with the Python proof of concept, this version is designed around throughput and latency first:
 
 - Go runtime and `nats.go` instead of Python asyncio.
-- One wildcard subscription per data direction instead of one subscription per tunnel.
-- One fixed subject per direction instead of per-session subjects, with the session ID carried in a compact binary frame header.
-- Per-session lock-free fast path using buffered channels.
-- Larger default frame size to cut NATS publish count roughly in half versus the previous `256 KiB` setting.
-- Short read-side coalescing window to merge bursty TCP reads into fewer NATS publishes.
-- Short write-side coalescing window plus batched socket writes to reduce syscall pressure on downloads.
+- Separate NATS connections for the control plane and the data plane so bulk traffic does not starve connect setup.
+- Sharded fixed data subjects instead of per-session or wildcard-routed subjects.
+- Compact binary framing with the session ID in the frame header.
+- Pooled frame buffers to reduce allocation and GC pressure on busy links.
+- Per-session bounded ring queue with backpressure timeout instead of raw channels.
+- Adaptive read-side coalescing to merge bursty socket reads into fewer NATS publishes.
+- Adaptive write-side batching to reduce syscall pressure on the receiving side.
 - Tuned TCP sockets: `TCP_NODELAY`, keepalive, read buffer, write buffer.
-- Bounded session queues so slow consumers fail fast instead of growing memory without bound.
+- Idle-session cleanup to remove stale state after restarts or abandoned flows.
+- Entry session IDs are unique across process restarts, which removes duplicate-session collisions after reconnects or deployments.
 - Request/reply is used only for connection setup. The data plane stays on plain pub/sub.
 
 ## Binaries
@@ -60,7 +62,7 @@ Example configs are included as:
 
 The files are JSON. Copy them to the filenames you want and pass them with `-config`.
 
-The NATS password now lives in the config file instead of the environment.
+The NATS password lives in the config file instead of the environment.
 
 ## Build
 
@@ -105,11 +107,11 @@ The observed IP should be the exit server IP.
 
 ## Subject layout
 
-With the default prefix `tuna`:
+With the default prefix `tuna` and `data_subject_shards = 16`:
 
 - Connect subject: `tuna.connect`
-- Entry -> exit data: `tuna.up`
-- Exit -> entry data: `tuna.down`
+- Entry -> exit data: `tuna.up.00` through `tuna.up.15`
+- Exit -> entry data: `tuna.down.00` through `tuna.down.15`
 
 Frames are binary:
 
@@ -117,31 +119,64 @@ Frames are binary:
 - 8 byte session ID
 - raw payload for data frames
 
+A session is pinned to one shard by `sessionID % data_subject_shards`.
+
+## Recommended tuning
+
+The example configs assume you also tune NATS for larger payloads.
+
+Recommended broker-side baseline:
+
+```yaml
+maxPayload: 2MB
+
+metrics:
+  enabled: true
+
+resources:
+  requests:
+    cpu: "1000m"
+    memory: "1Gi"
+  limits:
+    cpu: "4000m"
+    memory: "4Gi"
+```
+
+If you keep `maxPayload: 2MB`, the example Tuna values are a reasonable starting point:
+
+- `chunk_size_bytes: 1048576`
+- `write_batch_bytes: 4194304`
+- `data_subject_shards: 16`
+- `read_coalesce_min_delay: 50us`
+- `read_coalesce_max_delay: 500us`
+- `write_coalesce_min_delay: 50us`
+- `write_coalesce_max_delay: 500us`
+- `request_timeout: 15s`
+
 ## Operational notes
 
 - The entry listener binds to `127.0.0.1` by default. Keep it that way unless you add authentication and firewalling.
-- `chunk_size_bytes` must stay below the NATS server `max_payload` setting. If `maxPayload` is left unset in NATS, the effective server default is typically `1 MiB`, so the default `524288` byte frame size here is intentionally conservative.
-- `read_coalesce_delay` is the max extra wait after a socket read before publishing a frame. Raising it reduces publish count and improves throughput, but increases latency for very small interactive packets.
-- `write_coalesce_delay` and `write_batch_bytes` only affect NATS-to-socket writes. They do not change NATS payload size; they reduce write syscalls on the receiving side.
-- If you push very large downloads, tune `chunk_size_bytes`, coalescing delays, socket buffers, and NATS pending limits together.
-- For your current single-node single-replica manifest, the next NATS-side knobs to make explicit are `maxPayload: 1MB`, enabled metrics, and fixed CPU and memory requests/limits so the broker does not get throttled during bulk transfers.
+- `chunk_size_bytes` must stay below the NATS server `max_payload` setting. The `1048576` example value is meant for a `2MB` broker payload limit.
+- Adaptive coalescing is a tradeoff: low delays preserve responsiveness, high delays reduce message count. The included defaults are biased toward throughput without adding millisecond-scale latency.
+- `queue_backpressure_timeout` controls how long a session can fall behind before it is failed instead of buffering indefinitely.
+- `session_idle_timeout` and `cleanup_interval` are there to reap stale sessions after entry/exit restarts or broken clients. Keep them enabled.
+- `kubectl port-forward` is acceptable for quick testing and a bad idea for real tunnel traffic. Use a stable reachable NATS endpoint.
 
-## Expected impact
+## Expected impact of the current codebase
 
-These changes stay inside the existing all-data-over-NATS design. They do not remove the broker hop, so they are not a replacement for a different transport architecture.
+Relative to the earlier Go version, the cumulative changes should move results in roughly these ranges when the broker is not CPU-throttled:
 
-What they should improve in practice:
+- Sharded data subjects: `1.2x` to `2x` better throughput at higher concurrency, with lower broker hot-spotting.
+- Separate control/data NATS connections: `10%` to `30%` better connect latency under download load.
+- Adaptive coalescing and batched writes: `10%` to `40%` better sustained download throughput, depending on traffic shape.
+- Pooled frames and queue-based delivery: `5%` to `20%` lower CPU and better tail latency under load.
+- Restart-safe session IDs and idle cleanup: mainly correctness and stability, but they remove duplicate-session failures and stale-session buildup that would otherwise look like random performance problems.
 
-- `chunk_size_bytes` raised from `256 KiB` to `512 KiB`: about `1.3x` to `1.8x` better bulk throughput when the flow is publish-count bound.
-- `read_coalesce_delay` at `250us`: often `15%` to `35%` fewer NATS messages for bursty traffic, with a small latency tradeoff on tiny packets.
-- `write_coalesce_delay` plus `write_batch_bytes`: usually `10%` to `25%` better download throughput and lower CPU/syscall overhead on the receiver.
-- Larger default socket buffers and deeper queues: mostly a stability improvement under high-bandwidth, high-RTT flows, with `5%` to `15%` throughput gain when the old buffers were too small.
-- Fixed `tuna.up` / `tuna.down` subjects with binary session headers: usually another `5%` to `15%` less broker and client CPU at high message rates, with a modest latency improvement from removing wildcard subject parsing.
+A reasonable expectation if your NATS server is sized correctly:
 
-Overall expectation if the broker is not CPU-throttled:
-
-- latency: usually unchanged to `10%` better for downloads, slightly worse for isolated tiny packets because of the `250us` batching window
-- throughput: commonly `1.5x` to `2.8x` better than the previous Go version on sustained transfers
+- download throughput: another `1.5x` to `2.5x` over the older single-subject Go build
+- connect stability under browser-style parallelism: materially better
+- latency under load: `10%` to `30%` better on mixed traffic
 
 ## Automation
 

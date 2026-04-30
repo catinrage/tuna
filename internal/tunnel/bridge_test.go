@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"tuna/internal/session"
 )
 
 func TestBridgeRunCopiesSocketToPublisherAndBack(t *testing.T) {
@@ -16,14 +18,20 @@ func TestBridgeRunCopiesSocketToPublisherAndBack(t *testing.T) {
 	defer local.Close()
 	defer peer.Close()
 
-	incoming := make(chan []byte, 2)
+	incoming := session.NewQueue(4, time.Second)
 	published := make(chan []byte, 2)
+	pool := NewFramePool(FrameBufferSize(32))
 	bridge := Bridge{
-		SessionID:       7,
-		Conn:            local,
-		Incoming:        incoming,
-		ChunkSize:       32,
-		WriteBatchBytes: 32,
+		SessionID:             7,
+		Conn:                  local,
+		Incoming:              incoming,
+		FramePool:             pool,
+		ChunkSize:             32,
+		WriteBatchBytes:       32,
+		ReadCoalesceMinDelay:  0,
+		ReadCoalesceMaxDelay:  0,
+		WriteCoalesceMinDelay: 0,
+		WriteCoalesceMaxDelay: 0,
 		Publish: func(payload []byte) error {
 			published <- append([]byte(nil), payload...)
 			return nil
@@ -60,9 +68,11 @@ func TestBridgeRunCopiesSocketToPublisherAndBack(t *testing.T) {
 		t.Fatal("timed out waiting for published frame")
 	}
 
-	outbound := make([]byte, frameHeaderSize+5)
-	copy(outbound[frameHeaderSize:], []byte("world"))
-	incoming <- DataFrame(outbound, 7, 5)
+	outbound := pool.Get()
+	copy(outbound[FrameBufferSize(0):], []byte("world"))
+	if err := incoming.Push(context.Background(), session.NewFrame(DataFrame(outbound, 7, 5), pool.Put)); err != nil {
+		t.Fatalf("enqueue outbound frame: %v", err)
+	}
 
 	buf := make([]byte, 5)
 	if _, err := io.ReadFull(peer, buf); err != nil {
@@ -72,7 +82,9 @@ func TestBridgeRunCopiesSocketToPublisherAndBack(t *testing.T) {
 		t.Fatalf("bridged payload = %q, want world", buf)
 	}
 
-	incoming <- EOFFrame(7)
+	if err := incoming.Push(context.Background(), session.NewFrame(EOFFrame(7), nil)); err != nil {
+		t.Fatalf("enqueue eof: %v", err)
+	}
 
 	select {
 	case err := <-errCh:
@@ -96,16 +108,21 @@ func TestBridgePublishesEOFOnSocketClose(t *testing.T) {
 	defer local.Close()
 	defer peer.Close()
 
-	incoming := make(chan []byte)
+	incoming := session.NewQueue(1, time.Second)
 	var mu sync.Mutex
 	frames := make([][]byte, 0, 2)
 
 	bridge := Bridge{
-		SessionID:       1,
-		Conn:            local,
-		Incoming:        incoming,
-		ChunkSize:       32,
-		WriteBatchBytes: 32,
+		SessionID:             1,
+		Conn:                  local,
+		Incoming:              incoming,
+		FramePool:             NewFramePool(FrameBufferSize(32)),
+		ChunkSize:             32,
+		WriteBatchBytes:       32,
+		ReadCoalesceMinDelay:  0,
+		ReadCoalesceMaxDelay:  0,
+		WriteCoalesceMinDelay: 0,
+		WriteCoalesceMaxDelay: 0,
 		Publish: func(payload []byte) error {
 			mu.Lock()
 			defer mu.Unlock()
@@ -142,14 +159,20 @@ func TestBridgeRunPropagatesUnknownFrameError(t *testing.T) {
 	defer local.Close()
 	defer peer.Close()
 
-	incoming := make(chan []byte, 1)
+	incoming := session.NewQueue(1, time.Second)
+	pool := NewFramePool(FrameBufferSize(32))
 	bridge := Bridge{
-		SessionID:       9,
-		Conn:            local,
-		Incoming:        incoming,
-		ChunkSize:       32,
-		WriteBatchBytes: 32,
-		Publish:         func(payload []byte) error { return nil },
+		SessionID:             9,
+		Conn:                  local,
+		Incoming:              incoming,
+		FramePool:             pool,
+		ChunkSize:             32,
+		WriteBatchBytes:       32,
+		ReadCoalesceMinDelay:  0,
+		ReadCoalesceMaxDelay:  0,
+		WriteCoalesceMinDelay: 0,
+		WriteCoalesceMaxDelay: 0,
+		Publish:               func([]byte) error { return nil },
 	}
 
 	errCh := make(chan error, 1)
@@ -157,13 +180,15 @@ func TestBridgeRunPropagatesUnknownFrameError(t *testing.T) {
 		errCh <- bridge.Run(context.Background())
 	}()
 
-	invalid := make([]byte, frameHeaderSize)
+	invalid := make([]byte, FrameBufferSize(0))
 	invalid[0] = 'X'
-	incoming <- invalid
+	if err := incoming.Push(context.Background(), session.NewFrame(invalid, nil)); err != nil {
+		t.Fatalf("enqueue invalid frame: %v", err)
+	}
 
 	select {
 	case err := <-errCh:
-		if err == nil || !errors.Is(err, net.ErrClosed) && err.Error() != "unknown frame type 'X'" {
+		if err == nil || (!errors.Is(err, net.ErrClosed) && err.Error() != "unknown frame type 'X'") {
 			if err == nil || err.Error() != "unknown frame type 'X'" {
 				t.Fatalf("bridge error = %v, want unknown frame type", err)
 			}
@@ -178,15 +203,19 @@ func TestBridgeCoalescesSocketReads(t *testing.T) {
 	defer local.Close()
 	defer peer.Close()
 
-	incoming := make(chan []byte, 1)
+	incoming := session.NewQueue(1, time.Second)
 	published := make(chan []byte, 2)
 	bridge := Bridge{
-		SessionID:         11,
-		Conn:              local,
-		Incoming:          incoming,
-		ChunkSize:         32,
-		ReadCoalesceDelay: 5 * time.Millisecond,
-		WriteBatchBytes:   32,
+		SessionID:             11,
+		Conn:                  local,
+		Incoming:              incoming,
+		FramePool:             NewFramePool(FrameBufferSize(32)),
+		ChunkSize:             32,
+		WriteBatchBytes:       32,
+		ReadCoalesceMinDelay:  5 * time.Millisecond,
+		ReadCoalesceMaxDelay:  5 * time.Millisecond,
+		WriteCoalesceMinDelay: 0,
+		WriteCoalesceMaxDelay: 0,
 		Publish: func(payload []byte) error {
 			published <- append([]byte(nil), payload...)
 			return nil

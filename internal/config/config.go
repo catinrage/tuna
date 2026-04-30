@@ -42,11 +42,17 @@ type NATSConfig struct {
 
 type TunnelConfig struct {
 	SubjectPrefix               string   `json:"subject_prefix"`
+	DataSubjectShards           int      `json:"data_subject_shards"`
 	ChunkSizeBytes              int      `json:"chunk_size_bytes"`
-	ReadCoalesceDelay           Duration `json:"read_coalesce_delay"`
-	WriteCoalesceDelay          Duration `json:"write_coalesce_delay"`
 	WriteBatchBytes             int      `json:"write_batch_bytes"`
+	ReadCoalesceMinDelay        Duration `json:"read_coalesce_min_delay"`
+	ReadCoalesceMaxDelay        Duration `json:"read_coalesce_max_delay"`
+	WriteCoalesceMinDelay       Duration `json:"write_coalesce_min_delay"`
+	WriteCoalesceMaxDelay       Duration `json:"write_coalesce_max_delay"`
 	SessionQueueDepth           int      `json:"session_queue_depth"`
+	QueueBackpressureTimeout    Duration `json:"queue_backpressure_timeout"`
+	SessionIdleTimeout          Duration `json:"session_idle_timeout"`
+	CleanupInterval             Duration `json:"cleanup_interval"`
 	SubscriptionPendingMessages int      `json:"subscription_pending_messages"`
 	SubscriptionPendingBytes    int      `json:"subscription_pending_bytes"`
 	TCPNoDelay                  bool     `json:"tcp_no_delay"`
@@ -140,11 +146,17 @@ func applyDefaults(natsCfg *NATSConfig, tunnelCfg *TunnelConfig) {
 	natsCfg.ReconnectBufferBytes = 64 << 20
 
 	tunnelCfg.SubjectPrefix = "tuna"
+	tunnelCfg.DataSubjectShards = 16
 	tunnelCfg.ChunkSizeBytes = 512 << 10
-	tunnelCfg.ReadCoalesceDelay = Duration{Duration: 250 * time.Microsecond}
-	tunnelCfg.WriteCoalesceDelay = Duration{Duration: 250 * time.Microsecond}
 	tunnelCfg.WriteBatchBytes = 1 << 20
+	tunnelCfg.ReadCoalesceMinDelay = Duration{Duration: 50 * time.Microsecond}
+	tunnelCfg.ReadCoalesceMaxDelay = Duration{Duration: 500 * time.Microsecond}
+	tunnelCfg.WriteCoalesceMinDelay = Duration{Duration: 50 * time.Microsecond}
+	tunnelCfg.WriteCoalesceMaxDelay = Duration{Duration: 500 * time.Microsecond}
 	tunnelCfg.SessionQueueDepth = 2048
+	tunnelCfg.QueueBackpressureTimeout = Duration{Duration: 2 * time.Second}
+	tunnelCfg.SessionIdleTimeout = Duration{Duration: 2 * time.Minute}
+	tunnelCfg.CleanupInterval = Duration{Duration: 15 * time.Second}
 	tunnelCfg.SubscriptionPendingMessages = 256 * 1024
 	tunnelCfg.SubscriptionPendingBytes = 512 << 20
 	tunnelCfg.TCPNoDelay = true
@@ -203,16 +215,12 @@ func validateTunnel(cfg TunnelConfig) error {
 		return errors.New("tunnel.subject_prefix is required")
 	}
 
+	if cfg.DataSubjectShards <= 0 {
+		return errors.New("tunnel.data_subject_shards must be positive")
+	}
+
 	if cfg.ChunkSizeBytes <= 0 {
 		return errors.New("tunnel.chunk_size_bytes must be positive")
-	}
-
-	if cfg.ReadCoalesceDelay.Duration < 0 {
-		return errors.New("tunnel.read_coalesce_delay cannot be negative")
-	}
-
-	if cfg.WriteCoalesceDelay.Duration < 0 {
-		return errors.New("tunnel.write_coalesce_delay cannot be negative")
 	}
 
 	if cfg.WriteBatchBytes <= 0 {
@@ -223,8 +231,36 @@ func validateTunnel(cfg TunnelConfig) error {
 		return errors.New("tunnel.write_batch_bytes must be greater than or equal to tunnel.chunk_size_bytes")
 	}
 
+	if cfg.ReadCoalesceMinDelay.Duration < 0 || cfg.ReadCoalesceMaxDelay.Duration < 0 {
+		return errors.New("tunnel read coalesce delays cannot be negative")
+	}
+
+	if cfg.WriteCoalesceMinDelay.Duration < 0 || cfg.WriteCoalesceMaxDelay.Duration < 0 {
+		return errors.New("tunnel write coalesce delays cannot be negative")
+	}
+
+	if cfg.ReadCoalesceMaxDelay.Duration < cfg.ReadCoalesceMinDelay.Duration {
+		return errors.New("tunnel.read_coalesce_max_delay must be greater than or equal to tunnel.read_coalesce_min_delay")
+	}
+
+	if cfg.WriteCoalesceMaxDelay.Duration < cfg.WriteCoalesceMinDelay.Duration {
+		return errors.New("tunnel.write_coalesce_max_delay must be greater than or equal to tunnel.write_coalesce_min_delay")
+	}
+
 	if cfg.SessionQueueDepth <= 0 {
 		return errors.New("tunnel.session_queue_depth must be positive")
+	}
+
+	if cfg.QueueBackpressureTimeout.Duration <= 0 {
+		return errors.New("tunnel.queue_backpressure_timeout must be positive")
+	}
+
+	if cfg.SessionIdleTimeout.Duration <= 0 {
+		return errors.New("tunnel.session_idle_timeout must be positive")
+	}
+
+	if cfg.CleanupInterval.Duration <= 0 {
+		return errors.New("tunnel.cleanup_interval must be positive")
 	}
 
 	if cfg.SubscriptionPendingMessages <= 0 {

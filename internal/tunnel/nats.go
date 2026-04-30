@@ -9,9 +9,14 @@ import (
 	"tuna/internal/config"
 )
 
-func ConnectNATS(cfg config.NATSConfig, logger *log.Logger) (*nats.Conn, error) {
+func ConnectNATS(cfg config.NATSConfig, logger *log.Logger, role string) (*nats.Conn, error) {
+	name := cfg.Name
+	if role != "" {
+		name = cfg.Name + "-" + role
+	}
+
 	options := []nats.Option{
-		nats.Name(cfg.Name),
+		nats.Name(name),
 		nats.UserInfo(cfg.Username, cfg.Password),
 		nats.Timeout(cfg.ConnectTimeout.Duration),
 		nats.MaxReconnects(cfg.MaxReconnects),
@@ -21,23 +26,23 @@ func ConnectNATS(cfg config.NATSConfig, logger *log.Logger) (*nats.Conn, error) 
 		nats.ReconnectBufSize(cfg.ReconnectBufferBytes),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, disconnectErr error) {
 			if disconnectErr != nil {
-				logger.Printf("nats disconnected: %v", disconnectErr)
+				logger.Printf("nats %s disconnected: %v", role, disconnectErr)
 				return
 			}
-			logger.Printf("nats disconnected")
+			logger.Printf("nats %s disconnected", role)
 		}),
 		nats.ReconnectHandler(func(conn *nats.Conn) {
-			logger.Printf("nats reconnected: %s", conn.ConnectedUrl())
+			logger.Printf("nats %s reconnected: %s", role, conn.ConnectedUrl())
 		}),
 		nats.ClosedHandler(func(conn *nats.Conn) {
 			if lastErr := conn.LastError(); lastErr != nil {
-				logger.Printf("nats closed: %v", lastErr)
+				logger.Printf("nats %s closed: %v", role, lastErr)
 				return
 			}
-			logger.Printf("nats closed")
+			logger.Printf("nats %s closed", role)
 		}),
 		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, subErr error) {
-			logger.Printf("nats async error: %v", subErr)
+			logger.Printf("nats %s async error: %v", role, subErr)
 		}),
 	}
 
